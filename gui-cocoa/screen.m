@@ -59,6 +59,8 @@ static NSString *AuthPortDefaultsKey = @"DrawtermAuthPort";
 static NSString *UserDefaultsKey = @"DrawtermUser";
 static NSString *PassDefaultsKey = @"DrawtermPass";
 static NSString *SavePassDefaultsKey = @"DrawtermSavePass";
+static NSString *ServersDefaultsKey = @"DrawtermServers";
+static NSString *LastServerDefaultsKey = @"DrawtermLastServer";
 
 static inline NSString*
 trim(NSString *s)
@@ -522,9 +524,612 @@ mouseset(Point p)
 	}});
 }
 
+/* ---- static helpers ---- */
+
+static BOOL
+alreadyConnected(void)
+{
+	NSArray *args = [[NSProcessInfo processInfo] arguments];
+	for(NSString *a in args)
+		if([a isEqualToString:@"-h"])
+			return YES;
+	return NO;
+}
+
+static NSMutableArray *
+loadServers(void)
+{
+	NSArray *raw = [[NSUserDefaults standardUserDefaults] arrayForKey:ServersDefaultsKey];
+	if(raw == nil)
+		return [NSMutableArray array];
+	NSMutableArray *out = [NSMutableArray arrayWithCapacity:raw.count];
+	for(id item in raw)
+		[out addObject:[NSMutableDictionary dictionaryWithDictionary:item]];
+	return out;
+}
+
+static void
+saveServers(NSArray *servers)
+{
+	NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
+	[def setObject:servers forKey:ServersDefaultsKey];
+	[def synchronize];
+}
+
+static void
+migrateIfNeeded(void)
+{
+	NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
+	if([def objectForKey:ServersDefaultsKey] != nil)
+		return;
+	NSString *cpuHost = [def stringForKey:CpuHostDefaultsKey];
+	if(cpuHost == nil)
+		return;
+	NSMutableDictionary *d = [NSMutableDictionary dictionary];
+	d[@"name"]        = @"Default";
+	d[@"cpuHost"]     = cpuHost;
+	d[@"cpuPort"]     = [def stringForKey:CpuPortDefaultsKey] ?: @"17019";
+	d[@"authHost"]    = [def stringForKey:AuthHostDefaultsKey] ?: @"";
+	d[@"authPort"]    = [def stringForKey:AuthPortDefaultsKey] ?: @"";
+	d[@"user"]        = [def stringForKey:UserDefaultsKey] ?: @"glenda";
+	d[@"pass"]        = [def stringForKey:PassDefaultsKey] ?: @"";
+	d[@"savePass"]    = @([def boolForKey:SavePassDefaultsKey]);
+	d[@"autoConnect"] = @NO;
+	saveServers(@[d]);
+}
+
+static void
+execConnect(NSDictionary *server)
+{
+	NSString *cpuHost  = trim(server[@"cpuHost"]);
+	NSString *cpuPort  = trim(server[@"cpuPort"]);
+	NSString *authHost = trim(server[@"authHost"]);
+	NSString *authPort = trim(server[@"authPort"]);
+	NSString *user     = trim(server[@"user"]);
+	NSString *pass     = server[@"pass"] ?: @"";
+	BOOL savePass      = [server[@"savePass"] boolValue];
+
+	if(cpuHost.length == 0)  cpuHost  = @"localhost";
+	if(cpuPort.length == 0)  cpuPort  = @"17019";
+	if(user.length == 0)     user     = @"glenda";
+	if(!savePass)            pass     = @"";
+
+	NSString *exe = [[NSBundle mainBundle] executablePath];
+	if(exe == nil || exe.length == 0)
+		exe = [[NSProcessInfo processInfo] arguments][0];
+	char resolved[PATH_MAX];
+	if(realpath([exe UTF8String], resolved) != NULL)
+		exe = [NSString stringWithUTF8String:resolved];
+
+	NSString *cpustr  = [NSString stringWithFormat:@"tcp!%@!%@", cpuHost, cpuPort];
+	NSString *authTarget = authHost.length ? authHost : cpuHost;
+	NSString *authstr;
+	if(authPort.length)
+		authstr = [NSString stringWithFormat:@"tcp!%@!%@", authTarget, authPort];
+	else
+		authstr = [NSString stringWithFormat:@"tcp!%@", authTarget];
+
+	NSArray *argv = @[exe, @"-a", authstr, @"-h", cpustr, @"-u", user];
+	int argc = (int)argv.count;
+	char **cargv = calloc(argc + 1, sizeof(char *));
+	for(int i = 0; i < argc; i++)
+		cargv[i] = strdup([[argv objectAtIndex:i] UTF8String]);
+
+	if(pass.length)
+		setenv("PASS", [pass UTF8String], 1);
+	else
+		unsetenv("PASS");
+
+	execv(cargv[0], cargv);
+	for(int i = 0; i < argc; i++)
+		free(cargv[i]);
+	free(cargv);
+	_exit(1);
+}
+
+/* ---- ServerListController ---- */
+
+@interface ServerListController : NSObject <NSTableViewDataSource, NSTableViewDelegate>
+- (instancetype)init;
+- (void)showPanel;
+@end
+
+@implementation ServerListController
+{
+	NSPanel            *_panel;
+	NSTableView        *_tableView;
+	NSScrollView       *_scroll;
+	NSButton           *_addButton;
+	NSButton           *_editButton;
+	NSButton           *_deleteButton;
+	NSButton           *_connectButton;
+	NSButton           *_cancelButton;
+	NSMutableArray     *_servers;
+	NSInteger           _editingIndex;
+	id                  _keyMonitor;
+
+	NSPanel            *_editPanel;
+	NSTextField        *_nameField;
+	NSTextField        *_cpuHostField;
+	NSTextField        *_cpuPortField;
+	NSTextField        *_authHostField;
+	NSTextField        *_authPortField;
+	NSTextField        *_userField;
+	NSSecureTextField  *_passField;
+	NSButton           *_savePassCheck;
+}
+
+- (NSButton *)makeButtonTitle:(NSString *)title action:(SEL)sel
+{
+	NSButton *b = [[NSButton alloc] initWithFrame:NSZeroRect];
+	[b setTitle:title];
+	[b setTarget:self];
+	[b setAction:sel];
+	[b setBezelStyle:NSBezelStyleRounded];
+	[b sizeToFit];
+	return b;
+}
+
+- (NSTextField *)makeLabelText:(NSString *)text
+{
+	NSTextField *f = [NSTextField labelWithString:text];
+	[f setAlignment:NSTextAlignmentRight];
+	return f;
+}
+
+- (NSTextField *)makeEditFieldWidth:(CGFloat)w
+{
+	NSTextField *f = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, w, 22)];
+	return f;
+}
+
+- (void)buildServerListPanel
+{
+	_panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 500, 300)
+		styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable|NSWindowStyleMaskResizable
+		backing:NSBackingStoreBuffered defer:NO];
+	[_panel setTitle:@"Drawterm Servers"];
+	[_panel setReleasedWhenClosed:NO];
+	[[_panel standardWindowButton:NSWindowCloseButton] setTarget:self];
+	[[_panel standardWindowButton:NSWindowCloseButton] setAction:@selector(cancelPanel:)];
+
+	/* replace default content view so Auto Layout works cleanly */
+	NSView *cv = [[NSView alloc] init];
+	[_panel setContentView:cv];
+
+	_scroll = [NSScrollView new];
+	[_scroll setHasVerticalScroller:YES];
+	[_scroll setAutohidesScrollers:YES];
+	[_scroll setBorderType:NSBezelBorder];
+
+	_tableView = [NSTableView new];
+	[_tableView setUsesAlternatingRowBackgroundColors:YES];
+	[_tableView setAllowsMultipleSelection:NO];
+	[_tableView setAllowsEmptySelection:YES];
+	[_tableView setDataSource:self];
+	[_tableView setDelegate:self];
+	[_tableView setDoubleAction:@selector(tableDoubleClick:)];
+	[_tableView setTarget:self];
+	[_tableView setColumnAutoresizingStyle:NSTableViewNoColumnAutoresizing];
+
+	for(NSArray *def in @[
+		@[@"name", @"Name",  @150],
+		@[@"host", @"Host",  @150],
+		@[@"user", @"User",  @90],
+		@[@"auto", @"Auto",  @44],
+	]){
+		NSTableColumn *col = [[NSTableColumn alloc] initWithIdentifier:def[0]];
+		col.title = def[1];
+		col.width = [def[2] floatValue];
+		if([def[0] isEqualToString:@"auto"])
+			col.resizingMask = NSTableColumnNoResizing;
+		[_tableView addTableColumn:col];
+	}
+	[_scroll setDocumentView:_tableView];
+
+	_addButton     = [self makeButtonTitle:@"Add"     action:@selector(addServer:)];
+	_editButton    = [self makeButtonTitle:@"Edit"    action:@selector(editServer:)];
+	_deleteButton  = [self makeButtonTitle:@"Delete"  action:@selector(deleteServer:)];
+	_cancelButton  = [self makeButtonTitle:@"Cancel"  action:@selector(cancelPanel:)];
+	_connectButton = [self makeButtonTitle:@"Connect" action:@selector(connectServer:)];
+	[_connectButton setKeyEquivalent:@"\r"];
+
+	for(NSView *v in @[_scroll, _addButton, _editButton, _deleteButton, _cancelButton, _connectButton]){
+		[v setTranslatesAutoresizingMaskIntoConstraints:NO];
+		[cv addSubview:v];
+	}
+
+	NSDictionary *views = NSDictionaryOfVariableBindings(
+		_scroll, _addButton, _editButton, _deleteButton, _cancelButton, _connectButton);
+	NSDictionary *m = @{@"p":@12, @"g":@8, @"bh":@44};
+
+	NSMutableArray *cs = [NSMutableArray array];
+	[cs addObjectsFromArray:[NSLayoutConstraint constraintsWithVisualFormat:
+		@"H:|-(p)-[_scroll]-(p)-|" options:0 metrics:m views:views]];
+	[cs addObjectsFromArray:[NSLayoutConstraint constraintsWithVisualFormat:
+		@"V:|-(p)-[_scroll]-(bh)-|" options:0 metrics:m views:views]];
+	[cs addObjectsFromArray:[NSLayoutConstraint constraintsWithVisualFormat:
+		@"H:|-(p)-[_addButton]-(g)-[_editButton]-(g)-[_deleteButton]" options:NSLayoutFormatAlignAllCenterY metrics:m views:views]];
+	[cs addObjectsFromArray:[NSLayoutConstraint constraintsWithVisualFormat:
+		@"H:[_cancelButton]-(g)-[_connectButton]-(p)-|" options:NSLayoutFormatAlignAllCenterY metrics:m views:views]];
+	[cs addObjectsFromArray:[NSLayoutConstraint constraintsWithVisualFormat:
+		@"V:[_addButton]-(p)-|" options:0 metrics:m views:views]];
+	[cs addObjectsFromArray:[NSLayoutConstraint constraintsWithVisualFormat:
+		@"V:[_connectButton]-(p)-|" options:0 metrics:m views:views]];
+	[NSLayoutConstraint activateConstraints:cs];
+
+	[_editButton   setEnabled:NO];
+	[_deleteButton setEnabled:NO];
+	[_connectButton setEnabled:NO];
+}
+
+- (NSTextField *)addLabelText:(NSString *)text y:(CGFloat)y lx:(CGFloat)lx labelW:(CGFloat)w toView:(NSView *)cv
+{
+	NSTextField *lbl = [NSTextField labelWithString:text];
+	[lbl setFrame:NSMakeRect(lx, y, w, 22)];
+	[lbl setAlignment:NSTextAlignmentRight];
+	[cv addSubview:lbl];
+	return lbl;
+}
+
+- (void)buildEditPanel
+{
+	CGFloat pw = 420, ph = 360;
+	_editPanel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, pw, ph)
+		styleMask:NSWindowStyleMaskTitled
+		backing:NSBackingStoreBuffered defer:NO];
+	[_editPanel setReleasedWhenClosed:NO];
+
+	CGFloat labelW = 100, fieldW = 240, lx = 10, fx = 120;
+	CGFloat rowH = 28, gapY = 6;
+	NSView *cv = [_editPanel contentView];
+
+	/* checkboxes at the bottom of the field area */
+	CGFloat checkboxY = 10 + 2*(rowH + gapY);
+
+	_savePassCheck = [[NSButton alloc] initWithFrame:NSMakeRect(fx, checkboxY, fieldW, 22)];
+	[_savePassCheck setButtonType:NSButtonTypeSwitch];
+	[_savePassCheck setTitle:@"Save password"];
+	[cv addSubview:_savePassCheck];
+
+	/* text fields, top to bottom */
+	CGFloat y0 = checkboxY + 1*(rowH + gapY);
+	int idx = 0;
+	CGFloat y;
+
+#define NEXTROW(i) (y0 + (6 - (i)) * (rowH + gapY))
+
+	y = NEXTROW(idx); idx++;
+	[self addLabelText:@"Name:"      y:y lx:lx labelW:labelW toView:cv];
+	_nameField = [[NSTextField alloc] initWithFrame:NSMakeRect(fx, y, fieldW, 22)];
+	[cv addSubview:_nameField];
+
+	y = NEXTROW(idx); idx++;
+	[self addLabelText:@"CPU host:"  y:y lx:lx labelW:labelW toView:cv];
+	_cpuHostField = [[NSTextField alloc] initWithFrame:NSMakeRect(fx, y, fieldW, 22)];
+	[cv addSubview:_cpuHostField];
+
+	y = NEXTROW(idx); idx++;
+	[self addLabelText:@"CPU port:"  y:y lx:lx labelW:labelW toView:cv];
+	_cpuPortField = [[NSTextField alloc] initWithFrame:NSMakeRect(fx, y, 90, 22)];
+	[cv addSubview:_cpuPortField];
+
+	y = NEXTROW(idx); idx++;
+	[self addLabelText:@"Auth host:" y:y lx:lx labelW:labelW toView:cv];
+	_authHostField = [[NSTextField alloc] initWithFrame:NSMakeRect(fx, y, fieldW, 22)];
+	[cv addSubview:_authHostField];
+
+	y = NEXTROW(idx); idx++;
+	[self addLabelText:@"Auth port:" y:y lx:lx labelW:labelW toView:cv];
+	_authPortField = [[NSTextField alloc] initWithFrame:NSMakeRect(fx, y, 90, 22)];
+	[cv addSubview:_authPortField];
+
+	y = NEXTROW(idx); idx++;
+	[self addLabelText:@"User:"      y:y lx:lx labelW:labelW toView:cv];
+	_userField = [[NSTextField alloc] initWithFrame:NSMakeRect(fx, y, fieldW, 22)];
+	[cv addSubview:_userField];
+
+	y = NEXTROW(idx);
+	[self addLabelText:@"Password:"  y:y lx:lx labelW:labelW toView:cv];
+	_passField = [[NSSecureTextField alloc] initWithFrame:NSMakeRect(fx, y, fieldW, 22)];
+	[cv addSubview:_passField];
+
+#undef NEXTROW
+
+	NSButton *saveBtn   = [self makeButtonTitle:@"Save"   action:@selector(saveEditAndClose:)];
+	NSButton *cancelBtn = [self makeButtonTitle:@"Cancel" action:@selector(cancelEdit:)];
+	[saveBtn setKeyEquivalent:@"\r"];
+
+	CGFloat bx = pw - 10;
+	bx -= saveBtn.frame.size.width;
+	[saveBtn setFrameOrigin:NSMakePoint(bx, 10)];
+	bx -= 8 + cancelBtn.frame.size.width;
+	[cancelBtn setFrameOrigin:NSMakePoint(bx, 10)];
+	[cv addSubview:saveBtn];
+	[cv addSubview:cancelBtn];
+	[_editPanel setDefaultButtonCell:saveBtn.cell];
+}
+
+- (instancetype)init
+{
+	self = [super init];
+	if(self == nil)
+		return nil;
+	migrateIfNeeded();
+	_servers = loadServers();
+	_editingIndex = -1;
+	[self buildServerListPanel];
+	[self buildEditPanel];
+	return self;
+}
+
+- (void)showPanel
+{
+	_servers = loadServers();
+	[_tableView reloadData];
+
+	/* pre-select last connected server, fall back to row 0 */
+	NSInteger selRow = 0;
+	NSString *lastName = [[NSUserDefaults standardUserDefaults] stringForKey:LastServerDefaultsKey];
+	if(lastName){
+		for(NSInteger i = 0; i < (NSInteger)_servers.count; i++){
+			if([_servers[i][@"name"] isEqualToString:lastName]){
+				selRow = i;
+				break;
+			}
+		}
+	}
+	if(_servers.count > 0)
+		[_tableView selectRowIndexes:[NSIndexSet indexSetWithIndex:selRow] byExtendingSelection:NO];
+
+	BOOL hasSel = ([_tableView selectedRow] >= 0);
+	[_editButton   setEnabled:hasSel];
+	[_deleteButton setEnabled:hasSel];
+	[_connectButton setEnabled:hasSel];
+
+	if(_keyMonitor == nil){
+		__weak ServerListController *weakSelf = self;
+		_keyMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown handler:^NSEvent *(NSEvent *e){
+			ServerListController *s = weakSelf;
+			if(s == nil || e.window != s->_panel) return e;
+			NSUInteger mods = e.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
+			/* Delete — remove selected server */
+			if(e.keyCode == 51){
+				[s deleteServer:nil];
+				return nil;
+			}
+			/* Return / Enter — connect */
+			if(e.keyCode == 36 || e.keyCode == 76){
+				[s connectServer:nil];
+				return nil;
+			}
+			/* Cmd+N — add new server */
+			if(mods == NSEventModifierFlagCommand && [e.charactersIgnoringModifiers isEqualToString:@"n"]){
+				[s addServer:nil];
+				return nil;
+			}
+			return e;
+		}];
+	}
+
+	[_panel center];
+	[_panel makeKeyAndOrderFront:nil];
+}
+
+- (void)addServer:(id)sender
+{
+	[_panel makeKeyAndOrderFront:nil];
+	_editingIndex = -1;
+	[_editPanel setTitle:@"Add Server"];
+	[_nameField     setStringValue:@""];
+	[_cpuHostField  setStringValue:@""];
+	[_cpuPortField  setStringValue:@"17019"];
+	[_authHostField setStringValue:@""];
+	[_authPortField setStringValue:@""];
+	[_userField     setStringValue:@"glenda"];
+	[_passField     setStringValue:@""];
+	[_savePassCheck     setState:NSControlStateValueOff];
+	[_panel beginSheet:_editPanel completionHandler:^(NSModalResponse r){(void)r;}];
+	[_editPanel makeFirstResponder:_nameField];
+}
+
+- (void)editServer:(id)sender
+{
+	NSInteger row = [_tableView selectedRow];
+	if(row < 0 || row >= (NSInteger)_servers.count)
+		return;
+	_editingIndex = row;
+	NSDictionary *s = _servers[row];
+	[_editPanel setTitle:@"Edit Server"];
+	[_nameField     setStringValue:s[@"name"]     ?: @""];
+	[_cpuHostField  setStringValue:s[@"cpuHost"]  ?: @""];
+	[_cpuPortField  setStringValue:s[@"cpuPort"]  ?: @"17019"];
+	[_authHostField setStringValue:s[@"authHost"] ?: @""];
+	[_authPortField setStringValue:s[@"authPort"] ?: @""];
+	[_userField     setStringValue:s[@"user"]     ?: @"glenda"];
+	BOOL sp = [s[@"savePass"] boolValue];
+	[_savePassCheck setState:sp ? NSControlStateValueOn : NSControlStateValueOff];
+	[_passField setStringValue:(sp ? (s[@"pass"] ?: @"") : @"")];
+	[_panel beginSheet:_editPanel completionHandler:^(NSModalResponse r){(void)r;}];
+	[_editPanel makeFirstResponder:_cpuHostField];
+}
+
+- (void)deleteServer:(id)sender
+{
+	NSInteger row = [_tableView selectedRow];
+	if(row < 0 || row >= (NSInteger)_servers.count)
+		return;
+	NSString *name = _servers[row][@"name"] ?: @"this server";
+	NSAlert *alert = [NSAlert new];
+	[alert setMessageText:[NSString stringWithFormat:@"Delete \"%@\"?", name]];
+	[alert addButtonWithTitle:@"Delete"];
+	[alert addButtonWithTitle:@"Cancel"];
+	[alert setAlertStyle:NSAlertStyleWarning];
+	if([alert runModal] != NSAlertFirstButtonReturn)
+		return;
+	[_servers removeObjectAtIndex:row];
+	saveServers(_servers);
+	[_tableView reloadData];
+	BOOL hasSel = ([_tableView selectedRow] >= 0);
+	[_editButton  setEnabled:hasSel];
+	[_deleteButton setEnabled:hasSel];
+	[_connectButton setEnabled:hasSel];
+}
+
+- (void)connectServer:(id)sender
+{
+	NSInteger row = [_tableView selectedRow];
+	if(row < 0 || row >= (NSInteger)_servers.count)
+		return;
+	NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
+	[def setObject:_servers[row][@"name"] forKey:LastServerDefaultsKey];
+	[def synchronize];
+	execConnect(_servers[row]);
+}
+
+- (void)tableDoubleClick:(id)sender
+{
+	[self connectServer:nil];
+}
+
+- (void)cancelPanel:(id)sender
+{
+	if(_keyMonitor){
+		[NSEvent removeMonitor:_keyMonitor];
+		_keyMonitor = nil;
+	}
+	[_panel orderOut:nil];
+}
+
+- (void)saveEditAndClose:(id)sender
+{
+	NSString *name    = trim([_nameField stringValue]);
+	NSString *cpuHost = trim([_cpuHostField stringValue]);
+	if(name.length == 0 || cpuHost.length == 0){
+		NSAlert *alert = [NSAlert new];
+		[alert setMessageText:@"Name and CPU host are required."];
+		[alert runModal];
+		return;
+	}
+	BOOL savePass = (_savePassCheck.state == NSControlStateValueOn);
+	NSString *pass = savePass ? [_passField stringValue] : @"";
+
+	NSMutableDictionary *entry = [NSMutableDictionary dictionary];
+	entry[@"name"]        = name;
+	entry[@"cpuHost"]     = cpuHost;
+	entry[@"cpuPort"]     = trim([_cpuPortField stringValue]) ?: @"17019";
+	entry[@"authHost"]    = trim([_authHostField stringValue]) ?: @"";
+	entry[@"authPort"]    = trim([_authPortField stringValue]) ?: @"";
+	entry[@"user"]        = (trim([_userField stringValue]).length ? trim([_userField stringValue]) : @"glenda");
+	entry[@"pass"]        = pass;
+	entry[@"savePass"]    = @(savePass);
+	/* preserve autoConnect flag when editing; new servers default to NO */
+	entry[@"autoConnect"] = (_editingIndex >= 0 && _editingIndex < (NSInteger)_servers.count)
+		? _servers[_editingIndex][@"autoConnect"] : @NO;
+
+	if(_editingIndex >= 0 && _editingIndex < (NSInteger)_servers.count)
+		[_servers replaceObjectAtIndex:_editingIndex withObject:entry];
+	else
+		[_servers addObject:entry];
+	saveServers(_servers);
+	[_panel endSheet:_editPanel];
+	[_editPanel orderOut:nil];
+	[_tableView reloadData];
+	NSInteger selRow = (_editingIndex >= 0) ? _editingIndex : (NSInteger)_servers.count - 1;
+	[_tableView selectRowIndexes:[NSIndexSet indexSetWithIndex:selRow] byExtendingSelection:NO];
+	[_editButton  setEnabled:YES];
+	[_deleteButton setEnabled:YES];
+	[_connectButton setEnabled:YES];
+}
+
+- (void)cancelEdit:(id)sender
+{
+	[_panel endSheet:_editPanel];
+	[_editPanel orderOut:nil];
+}
+
+/* NSTableViewDataSource */
+
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)tv
+{
+	return (NSInteger)_servers.count;
+}
+
+- (NSView *)tableView:(NSTableView *)tv viewForTableColumn:(NSTableColumn *)col row:(NSInteger)row
+{
+	if(row < 0 || row >= (NSInteger)_servers.count)
+		return nil;
+	NSDictionary *s = _servers[row];
+	NSString *ident = col.identifier;
+
+	if([ident isEqualToString:@"auto"]){
+		NSButton *btn = [tv makeViewWithIdentifier:@"autoCheck" owner:self];
+		if(btn == nil){
+			btn = [[NSButton alloc] initWithFrame:NSMakeRect(0, 0, 22, 22)];
+			[btn setButtonType:NSButtonTypeSwitch];
+			[btn setTitle:@""];
+			[btn setIdentifier:@"autoCheck"];
+			[btn setTarget:self];
+			[btn setAction:@selector(autoCheckClicked:)];
+		}
+		[btn setState:[s[@"autoConnect"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff];
+		[btn setTag:row];
+		return btn;
+	}
+
+	NSTextField *tf = [tv makeViewWithIdentifier:ident owner:self];
+	if(tf == nil){
+		tf = [NSTextField labelWithString:@""];
+		[tf setFrame:NSMakeRect(0, 0, col.width, 17)];
+		[tf setAutoresizingMask:NSViewWidthSizable|NSViewHeightSizable];
+		[tf setIdentifier:ident];
+	}
+	NSString *text = @"";
+	if([ident isEqualToString:@"name"]) text = s[@"name"] ?: @"";
+	if([ident isEqualToString:@"host"]) text = s[@"cpuHost"] ?: @"";
+	if([ident isEqualToString:@"user"]) text = s[@"user"] ?: @"";
+	[tf setStringValue:text];
+	return tf;
+}
+
+- (void)autoCheckClicked:(NSButton *)btn
+{
+	NSInteger row = btn.tag;
+	if(row < 0 || row >= (NSInteger)_servers.count)
+		return;
+	BOOL newVal = (btn.state == NSControlStateValueOn);
+	if(newVal){
+		for(NSMutableDictionary *d in _servers)
+			d[@"autoConnect"] = @NO;
+		_servers[row][@"autoConnect"] = @YES;
+	} else {
+		_servers[row][@"autoConnect"] = @NO;
+	}
+	saveServers(_servers);
+	[_tableView reloadData];
+}
+
+/* NSTableViewDelegate */
+
+- (void)tableViewSelectionDidChange:(NSNotification *)n
+{
+	BOOL hasSel = ([_tableView selectedRow] >= 0);
+	[_editButton  setEnabled:hasSel];
+	[_deleteButton setEnabled:hasSel];
+	[_connectButton setEnabled:hasSel];
+}
+
+@end
+
+/* ---- AppDelegate ---- */
+
 @implementation AppDelegate
 {
-	NSWindow *_window;
+	NSWindow  *_window;
+	ServerListController *_serverList;
+	NSPanel   *_prefsPanel;
+	NSSlider  *_prefsSlider;
+	NSTextField *_prefsValueLabel;
 }
 
 - (void)scaleSliderChanged:(NSSlider *)sender
@@ -536,9 +1141,8 @@ mouseset(Point p)
 	else
 		v = round(v/step)*step;
 	[sender setDoubleValue:v];
-	NSTextField *label = (NSTextField *)objc_getAssociatedObject(sender, @"scaleLabel");
-	if(label)
-		[label setStringValue:(v == 0.0 ? @"raw" : [NSString stringWithFormat:@"%.2f", v])];
+	if(_prefsValueLabel)
+		[_prefsValueLabel setStringValue:(v == 0.0 ? @"raw" : [NSString stringWithFormat:@"%.2f", v])];
 }
 
 - (NSWindow *)window
@@ -564,179 +1168,128 @@ mouseset(Point p)
 	forcefullredraw = 1;
 }
 
-- (void)openPreferences:(id)sender
+- (void)openAbout:(id)sender
+{
+	NSString *version = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"";
+	NSMutableAttributedString *credits = [[NSMutableAttributedString alloc] init];
+	NSDictionary *attrs = @{NSFontAttributeName: [NSFont systemFontOfSize:11]};
+	[[credits mutableString] setString:
+		@"drawterm connects to Plan 9 CPU servers.\n\n"
+		 "Original drawterm by Russ Cox and the Bell Labs Plan 9 team.\n"
+		 "macOS Cocoa backend, HiDPI scaling, and connection UI by Rui Carmo.\n"
+		 "OpenGL → Metal port by Jacob Moody (thanks jxy & Keegan).\n"
+		 "CoreAudio backend and server management UI by Jason Green,\n"
+		 "assisted by Claude (Anthropic).\n"
+		 "Upstream kernel and library work by the 9front contributors.\n\n"
+		 "Copyright © 2018–2026 respective authors.\n"
+		 "All cats reserved."];
+	[credits setAttributes:attrs range:NSMakeRange(0, credits.length)];
+	[NSApp orderFrontStandardAboutPanelWithOptions:@{
+		@"ApplicationName":    @"drawterm",
+		@"ApplicationVersion": version,
+		@"Credits":            credits,
+	}];
+}
+
+- (void)buildPrefsPanel
 {
 	double detected = detectscale(self.window.backingScaleFactor);
-	NSAlert *alert = [NSAlert new];
-	NSImage *icon = [NSApp applicationIconImage];
-	if(icon)
-		[alert setIcon:icon];
-	[alert setMessageText:@"Interface Scale"];
-	[alert setInformativeText:[NSString stringWithFormat:@"Adjust UI size for HiDPI/Retina displays. Detected: %.2f", detected]];
-	NSSlider *slider = [NSSlider sliderWithValue:uiscale
-		minValue:0.0
-		maxValue:4
-		target:self
-		action:@selector(scaleSliderChanged:)];
-	[slider setAllowsTickMarkValuesOnly:YES];
-	[slider setNumberOfTickMarks:17]; // 0.0..4.0 in 0.25 steps
-	[slider setContinuous:YES];
-	NSTextField *value = [NSTextField labelWithString:(uiscale == 0.0 ? @"raw" : [NSString stringWithFormat:@"%.2f", uiscale])];
-	[value setFrame:NSMakeRect(220, 18, 32, 16)];
-	[value setAlignment:NSTextAlignmentRight];
-	objc_setAssociatedObject(slider, @"scaleLabel", value, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-	NSView *box = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 260, 48)];
-	[slider setFrame:NSMakeRect(10, 12, 200, 24)];
-	[box addSubview:slider];
-	[box addSubview:value];
-	[alert setAccessoryView:box];
-	[alert addButtonWithTitle:@"OK"];
-	[alert addButtonWithTitle:@"Cancel"];
 
-	if([alert runModal] == NSAlertFirstButtonReturn){
-		double newScale = slider.doubleValue;
-		if(newScale < 0.125)
-			newScale = 0.0;
-		else
-			newScale = round(newScale/0.25)*0.25;
-		if(newScale != uiscale){
-			NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
-			[def setDouble:newScale forKey:ScaleDefaultsKey];
-			[def synchronize];
-			[self applyScaleAndResize:newScale];
-		}else{
-		}
+	_prefsPanel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 340, 140)
+		styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable
+		backing:NSBackingStoreBuffered defer:NO];
+	[_prefsPanel setTitle:@"Settings"];
+	[_prefsPanel setReleasedWhenClosed:NO];
+
+	NSView *cv = [[NSView alloc] init];
+	[_prefsPanel setContentView:cv];
+
+	NSTextField *heading = [NSTextField labelWithString:@"Interface Scale"];
+	[heading setFont:[NSFont boldSystemFontOfSize:13]];
+
+	NSString *infoStr = [NSString stringWithFormat:@"HiDPI scale for Retina displays. Detected: %.2f", detected];
+	NSTextField *info = [NSTextField wrappingLabelWithString:infoStr];
+	[info setTextColor:[NSColor secondaryLabelColor]];
+	[info setFont:[NSFont systemFontOfSize:11]];
+
+	_prefsSlider = [NSSlider sliderWithValue:uiscale minValue:0.0 maxValue:4.0
+		target:self action:@selector(scaleSliderChanged:)];
+	[_prefsSlider setAllowsTickMarkValuesOnly:YES];
+	[_prefsSlider setNumberOfTickMarks:17];
+	[_prefsSlider setContinuous:YES];
+
+	NSString *valStr = (uiscale == 0.0) ? @"raw" : [NSString stringWithFormat:@"%.2f", uiscale];
+	_prefsValueLabel = [NSTextField labelWithString:valStr];
+	[_prefsValueLabel setAlignment:NSTextAlignmentRight];
+
+	NSButton *okBtn     = [NSButton buttonWithTitle:@"OK" target:self action:@selector(prefsOK:)];
+	NSButton *cancelBtn = [NSButton buttonWithTitle:@"Cancel" target:self action:@selector(prefsCancel:)];
+	[okBtn setKeyEquivalent:@"\r"];
+
+	for(NSView *v in @[heading, info, _prefsSlider, _prefsValueLabel, okBtn, cancelBtn]){
+		[v setTranslatesAutoresizingMaskIntoConstraints:NO];
+		[cv addSubview:v];
 	}
+
+	NSDictionary *views = NSDictionaryOfVariableBindings(
+		heading, info, _prefsSlider, _prefsValueLabel, okBtn, cancelBtn);
+	NSDictionary *m = @{@"p":@12, @"g":@6, @"s":@48};
+
+	NSMutableArray *cs = [NSMutableArray array];
+	[cs addObjectsFromArray:[NSLayoutConstraint constraintsWithVisualFormat:
+		@"H:|-(p)-[heading]-(p)-|" options:0 metrics:m views:views]];
+	[cs addObjectsFromArray:[NSLayoutConstraint constraintsWithVisualFormat:
+		@"H:|-(p)-[info]-(p)-|" options:0 metrics:m views:views]];
+	[cs addObjectsFromArray:[NSLayoutConstraint constraintsWithVisualFormat:
+		@"H:|-(p)-[_prefsSlider]-[_prefsValueLabel(==40)]-(p)-|" options:NSLayoutFormatAlignAllCenterY metrics:m views:views]];
+	[cs addObjectsFromArray:[NSLayoutConstraint constraintsWithVisualFormat:
+		@"H:[cancelBtn]-(g)-[okBtn]-(p)-|" options:NSLayoutFormatAlignAllCenterY metrics:m views:views]];
+	[cs addObjectsFromArray:[NSLayoutConstraint constraintsWithVisualFormat:
+		@"V:|-(p)-[heading]-(g)-[info]-(g)-[_prefsSlider]-(g)-[okBtn]-(p)-|" options:0 metrics:m views:views]];
+	[cs addObject:[cancelBtn.bottomAnchor constraintEqualToAnchor:okBtn.bottomAnchor]];
+	[NSLayoutConstraint activateConstraints:cs];
+}
+
+- (void)prefsOK:(id)sender
+{
+	double newScale = _prefsSlider.doubleValue;
+	if(newScale < 0.125)
+		newScale = 0.0;
+	else
+		newScale = round(newScale/0.25)*0.25;
+	[_prefsPanel orderOut:nil];
+	if(newScale != uiscale){
+		NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
+		[def setDouble:newScale forKey:ScaleDefaultsKey];
+		[def synchronize];
+		[self applyScaleAndResize:newScale];
+	}
+}
+
+- (void)prefsCancel:(id)sender
+{
+	[_prefsSlider setDoubleValue:uiscale];
+	NSString *v = (uiscale == 0.0) ? @"raw" : [NSString stringWithFormat:@"%.2f", uiscale];
+	[_prefsValueLabel setStringValue:v];
+	[_prefsPanel orderOut:nil];
+}
+
+- (void)openPreferences:(id)sender
+{
+	if(_prefsPanel == nil)
+		[self buildPrefsPanel];
+	[_prefsSlider setDoubleValue:uiscale];
+	NSString *v = (uiscale == 0.0) ? @"raw" : [NSString stringWithFormat:@"%.2f", uiscale];
+	[_prefsValueLabel setStringValue:v];
+	[_prefsPanel center];
+	[_prefsPanel makeKeyAndOrderFront:nil];
 }
 
 - (void)openConnect:(id)sender
 {
-	NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
-	NSString *cpuHost = [def stringForKey:CpuHostDefaultsKey] ?: @"192.168.1.226";
-	NSString *cpuPort = [def stringForKey:CpuPortDefaultsKey] ?: @"17019";
-	NSString *authHost = [def stringForKey:AuthHostDefaultsKey] ?: @"";
-	NSString *authPort = [def stringForKey:AuthPortDefaultsKey] ?: @"";
-	NSString *user = [def stringForKey:UserDefaultsKey] ?: @"glenda";
-	BOOL savePassFlag = [def boolForKey:SavePassDefaultsKey];
-	NSString *pass = savePassFlag ? ([def stringForKey:PassDefaultsKey] ?: @"") : @"";
-
-	NSAlert *alert = [NSAlert new];
-	[alert setMessageText:@"Connect to server"];
-	[alert setInformativeText:@"Enter CPU/auth addresses and user. Empty auth host will reuse CPU."];
-
-	CGFloat rowH = 28;
-	CGFloat gapY = 6;
-	CGFloat labelW = 90;
-	CGFloat fieldW = 220;
-	NSView *box = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 400, rowH * 6 + gapY * 5 + 12)];
-	NSTextField *cpuHostField = [[NSTextField alloc] initWithFrame:NSMakeRect(labelW + 20, rowH * 5 + gapY * 5, fieldW, 22)];
-	NSTextField *cpuPortField = [[NSTextField alloc] initWithFrame:NSMakeRect(labelW + 20, rowH * 4 + gapY * 4, 90, 22)];
-	NSTextField *authHostField = [[NSTextField alloc] initWithFrame:NSMakeRect(labelW + 20, rowH * 3 + gapY * 3, fieldW, 22)];
-	NSTextField *authPortField = [[NSTextField alloc] initWithFrame:NSMakeRect(labelW + 20, rowH * 2 + gapY * 2, 90, 22)];
-	NSTextField *userField = [[NSTextField alloc] initWithFrame:NSMakeRect(labelW + 20, rowH * 1 + gapY * 1, 160, 22)];
-	NSSecureTextField *passField = [[NSSecureTextField alloc] initWithFrame:NSMakeRect(labelW + 20, rowH * 0 + gapY * 0, 180, 22)];
-	NSButton *savePass = [[NSButton alloc] initWithFrame:NSMakeRect(labelW + 210, rowH * 0 + gapY * 0 - 2, 140, 22)];
-
-	[cpuHostField setStringValue:cpuHost ?: @""];
-	[cpuPortField setStringValue:cpuPort ?: @""];
-	[authHostField setStringValue:authHost ?: @""];
-	[authPortField setStringValue:authPort ?: @""];
-	[userField setStringValue:user ?: @""];
-	[passField setStringValue:pass ?: @""];
-	[savePass setButtonType:NSSwitchButton];
-	[savePass setTitle:@"Save password"];
-	[savePass setState:savePassFlag ? NSControlStateValueOn : NSControlStateValueOff];
-
-	NSArray *labels = @[@"CPU host", @"CPU port", @"Auth host", @"Auth port", @"User", @"Password"];
-	NSArray *frames = @[
-		[NSValue valueWithRect:NSMakeRect(10, rowH * 5 + gapY * 5, labelW, 22)],
-		[NSValue valueWithRect:NSMakeRect(10, rowH * 4 + gapY * 4, labelW, 22)],
-		[NSValue valueWithRect:NSMakeRect(10, rowH * 3 + gapY * 3, labelW, 22)],
-		[NSValue valueWithRect:NSMakeRect(10, rowH * 2 + gapY * 2, labelW, 22)],
-		[NSValue valueWithRect:NSMakeRect(10, rowH * 1 + gapY * 1, labelW, 22)],
-		[NSValue valueWithRect:NSMakeRect(10, rowH * 0 + gapY * 0, labelW, 22)]
-	];
-	for(NSUInteger i = 0; i < labels.count; i++){
-		NSTextField *lbl = [NSTextField labelWithString:labels[i]];
-		[lbl setFrame:[frames[i] rectValue]];
-		[box addSubview:lbl];
-	}
-
-	[box addSubview:cpuHostField];
-	[box addSubview:cpuPortField];
-	[box addSubview:authHostField];
-	[box addSubview:authPortField];
-	[box addSubview:userField];
-	[box addSubview:passField];
-	[box addSubview:savePass];
-
-	[alert setAccessoryView:box];
-	[alert addButtonWithTitle:@"Connect"];
-	[alert addButtonWithTitle:@"Cancel"];
-
-	NSInteger resp = [alert runModal];
-	if(resp != NSAlertFirstButtonReturn)
-		return;
-
-	cpuHost = trim([cpuHostField stringValue]);
-	if(cpuHost.length == 0)
-		cpuHost = @"localhost";
-	cpuPort = trim([cpuPortField stringValue]);
-	if(cpuPort.length == 0)
-		cpuPort = @"17019";
-	authHost = trim([authHostField stringValue]);
-	authPort = trim([authPortField stringValue]);
-	user = trim([userField stringValue]);
-	if(user.length == 0)
-		user = @"glenda";
-	pass = [passField stringValue];
-
-	[def setObject:cpuHost forKey:CpuHostDefaultsKey];
-	[def setObject:cpuPort forKey:CpuPortDefaultsKey];
-	[def setObject:authHost forKey:AuthHostDefaultsKey];
-	[def setObject:authPort forKey:AuthPortDefaultsKey];
-	[def setObject:user forKey:UserDefaultsKey];
-	BOOL shouldSavePass = (savePass.state == NSControlStateValueOn);
-	[def setBool:shouldSavePass forKey:SavePassDefaultsKey];
-	if(shouldSavePass && pass.length)
-		[def setObject:pass forKey:PassDefaultsKey];
-	else
-		[def removeObjectForKey:PassDefaultsKey];
-	[def synchronize];
-
-	NSMutableArray<NSString *> *argv = [NSMutableArray array];
-	NSString *exe = [[NSBundle mainBundle] executablePath];
-	if(exe == nil || [exe length] == 0)
-		exe = [[NSProcessInfo processInfo] arguments][0];
-	char resolved[PATH_MAX];
-	if(realpath([exe UTF8String], resolved) != NULL)
-		exe = [NSString stringWithUTF8String:resolved];
-	[argv addObject:exe];
-	NSString *cpustr = [NSString stringWithFormat:@"tcp!%@!%@", cpuHost, cpuPort];
-	NSString *authstr;
-	NSString *authTarget = authHost.length ? authHost : cpuHost;
-	if(authPort.length)
-		authstr = [NSString stringWithFormat:@"tcp!%@!%@", authTarget, authPort];
-	else
-		authstr = [NSString stringWithFormat:@"tcp!%@", authTarget];
-	[argv addObjectsFromArray:@[@"-a", authstr]];
-	[argv addObjectsFromArray:@[@"-h", cpustr]];
-	[argv addObjectsFromArray:@[@"-u", user]];
-	if(pass.length)
-		setenv("PASS", [pass UTF8String], 1);
-	else
-		unsetenv("PASS");
-
-	int argc = (int)[argv count];
-	char **cargv = calloc(argc + 1, sizeof(char *));
-	for(int i = 0; i < argc; i++)
-		cargv[i] = strdup([[argv objectAtIndex:i] UTF8String]);
-	execv(cargv[0], cargv);
-	// If exec fails, clean up and report, then exit so we don’t hang.
-	for(int i = 0; i < argc; i++)
-		free(cargv[i]);
-	free(cargv);
-	_exit(1);
+	if(_serverList == nil)
+		_serverList = [ServerListController new];
+	[_serverList showPanel];
 }
 
 static void
@@ -766,14 +1319,16 @@ mainproc(void *aux)
 	LOG(@"BEGIN");
 
 	NSMenu *sm = [NSMenu new];
+	[sm addItemWithTitle:@"About drawterm" action:@selector(openAbout:) keyEquivalent:@""];
+	[sm addItem:[NSMenuItem separatorItem]];
 	[sm addItemWithTitle:@"Toggle Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"F"];
 	[sm addItemWithTitle:@"Hide" action:@selector(hide:) keyEquivalent:@"H"];
 	[sm addItemWithTitle:@"Connect…" action:@selector(openConnect:) keyEquivalent:@"o"];
-	[sm addItemWithTitle:@"Preferences…" action:@selector(openPreferences:) keyEquivalent:@","];
-	[sm addItemWithTitle:@"Quit" action:@selector(terminate:) keyEquivalent:@"q"];
+	[sm addItemWithTitle:@"Settings…" action:@selector(openPreferences:) keyEquivalent:@","];
+	[sm addItemWithTitle:@"Quit drawterm" action:@selector(terminate:) keyEquivalent:@"q"];
 	NSMenu *m = [NSMenu new];
-	[m addItemWithTitle:@"DEVDRAW" action:NULL keyEquivalent:@""];
-	[m setSubmenu:sm forItem:[m itemWithTitle:@"DEVDRAW"]];
+	[m addItemWithTitle:@"drawterm" action:NULL keyEquivalent:@""];
+	[m setSubmenu:sm forItem:[m itemWithTitle:@"drawterm"]];
 	[NSApp setMainMenu:m];
 
 	const NSWindowStyleMask Winstyle = NSWindowStyleMaskTitled
@@ -789,7 +1344,18 @@ mainproc(void *aux)
 
 	_window = [[NSWindow alloc] initWithContentRect:r styleMask:Winstyle
 		backing:NSBackingStoreBuffered defer:NO];
-	[_window setTitle:@"drawterm"];
+	NSString *windowTitle = @"drawterm";
+	NSArray *pargs = [[NSProcessInfo processInfo] arguments];
+	for(NSUInteger i = 0; i + 1 < pargs.count; i++){
+		if([pargs[i] isEqualToString:@"-h"]){
+			/* extract host from "tcp!host!port" */
+			NSArray *parts = [pargs[i+1] componentsSeparatedByString:@"!"];
+			NSString *host = parts.count > 1 ? parts[1] : pargs[i+1];
+			windowTitle = [NSString stringWithFormat:@"drawterm — %@", host];
+			break;
+		}
+	}
+	[_window setTitle:windowTitle];
 	[_window center];
 	[_window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
 	[_window setContentMinSize:NSMakeSize(64,64)];
@@ -806,6 +1372,17 @@ mainproc(void *aux)
 
 	[_window makeKeyAndOrderFront:self];
 	[NSApp activateIgnoringOtherApps:YES];
+
+	migrateIfNeeded();
+	if(!alreadyConnected()){
+		NSArray *svrs = loadServers();
+		for(NSDictionary *s in svrs){
+			if([s[@"autoConnect"] boolValue]){
+				execConnect(s);
+				break;
+			}
+		}
+	}
 
 	LOG(@"launch mainproc");
 	kproc("mainproc", mainproc, 0);
