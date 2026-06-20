@@ -28,5 +28,7 @@
 	<string>MainWindow</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Drawterm needs access to the microphone to enable audio input for remote Plan 9 sessions.</string>
 </dict>
 </plist>

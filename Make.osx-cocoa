@@ -8,9 +8,9 @@ CFLAGS=-Wall -Wno-missing-braces -ggdb -I$(ROOT) -I$(ROOT)/include -I$(ROOT)/ker
 O=o
 OS=posix
 GUI=cocoa
-LDADD=-ggdb -framework Cocoa -framework Metal -framework QuartzCore
+LDADD=-ggdb -framework Cocoa -framework Metal -framework QuartzCore -framework CoreAudio -framework AudioToolbox
 LDFLAGS=$(PTHREAD)
 TARG=drawterm
-AUDIO=none
+AUDIO=macosx
 
 all: default

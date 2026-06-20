@@ -12,8 +12,8 @@ enum
 	Qvolume,
 
 	Aclosed		= 0,
-	Aread,
-	Awrite,
+	Aread		= 1,
+	Awrite		= 2,
 
 	Speed		= 44100,
 	Ncmd		= 50,		/* max volume command words */
@@ -111,18 +111,21 @@ audioopen(Chan *c, int omode)
 		break;
 
 	case Qaudio:
-		amode = Awrite;
-		if((omode&7) == OREAD)
-			amode = Aread;
+		amode = 0;
+		if((omode&7) == OREAD || (omode&7) == ORDWR)
+			amode |= Aread;
+		if((omode&7) == OWRITE || (omode&7) == ORDWR)
+			amode |= Awrite;
 		aqlock(&audio);
 		if(waserror()){
 			aqunlock(&audio);
 			nexterror();
 		}
-		if(audio.amode != Aclosed)
+		if(audio.amode & amode)
 			error(Einuse);
-		audiodevopen();
-		audio.amode = amode;
+		if(audio.amode == Aclosed)
+			audiodevopen();
+		audio.amode |= amode;
 		poperror();
 		aqunlock(&audio);
 		break;
@@ -150,8 +153,14 @@ audioclose(Chan *c)
 	case Qaudio:
 		if(c->flag & COPEN) {
 			aqlock(&audio);
-			audiodevclose();
-			audio.amode = Aclosed;
+			if(c->mode == OREAD)
+				audio.amode &= ~Aread;
+			else if(c->mode == OWRITE)
+				audio.amode &= ~Awrite;
+			else
+				audio.amode &= ~(Aread|Awrite);
+			if(audio.amode == Aclosed)
+				audiodevclose();
 			aqunlock(&audio);
 		}
 		break;
@@ -178,16 +187,9 @@ audioread(Chan *c, void *v, long n, vlong off)
 		return devdirread(c, a, n, audiodir, nelem(audiodir), devgen);
 
 	case Qaudio:
-		if(audio.amode != Aread)
+		if(!(audio.amode & Aread))
 			error(Emode);
-		aqlock(&audio);
-		if(waserror()){
-			aqunlock(&audio);
-			nexterror();
-		}
 		n = audiodevread(v, n);
-		poperror();
-		aqunlock(&audio);
 		break;
 
 	case Qvolume:
@@ -324,16 +326,9 @@ audiowrite(Chan *c, void *vp, long n, vlong off)
 		break;
 
 	case Qaudio:
-		if(audio.amode != Awrite)
+		if(!(audio.amode & Awrite))
 			error(Emode);
-		aqlock(&audio);
-		if(waserror()){
-			aqunlock(&audio);
-			nexterror();
-		}
 		n = audiodevwrite(vp, n);
-		poperror();
-		aqunlock(&audio);
 		break;
 	}
 	return n;
